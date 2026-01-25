@@ -38,7 +38,9 @@ To download audio only:
 `python download.py <youtube_url> -o`
 
 Examples
+
 `python download.py https://youtube.com/watch?v=example`
+
 `python download.py https://youtube.com/watch?v=example -o`
 
 ## How It Works ?
