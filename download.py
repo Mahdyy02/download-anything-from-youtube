@@ -1,29 +1,21 @@
-import sys
+#!/usr/bin/env python3
+"""
+ytb - a simple YouTube downloader CLI.
+
+Usage:
+    ytb <youtube_url>
+    ytb <youtube_url> -o | --audio-only
+    ytb <youtube_url> -d ~/Videos
+"""
+
+import argparse
 import os
+import shutil
 import subprocess
+import sys
+
 from pytubefix import YouTube
 from tqdm import tqdm
-import winsound
-
-# Get Downloads folder path
-DOWNLOADS_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads")
-os.makedirs(DOWNLOADS_FOLDER, exist_ok=True)
-
-if len(sys.argv) < 2:
-    print("=" * 60)
-    print("YouTube Downloader")
-    print("=" * 60)
-    print("\nUsage:")
-    print("  python download.py <youtube_url>")
-    print("  python download.py <youtube_url> -o | --audio_only")
-    print("\nExamples:")
-    print("  python download.py https://youtube.com/watch?v=...")
-    print("  python download.py https://youtube.com/watch?v=... -o")
-    print("=" * 60)
-    sys.exit(1)
-
-url = sys.argv[1]
-audio_only = "-o" in sys.argv or "--audio_only" in sys.argv
 
 video_bar = None
 audio_bar = None
@@ -57,21 +49,101 @@ def on_progress(stream, chunk, bytes_remaining):
     bar.refresh()
 
 
-print("\n" + "=" * 60)
-print("Fetching video information...")
-print("=" * 60)
+def notify(title, message):
+    """Best-effort desktop notification. Silently does nothing if unavailable."""
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", title, message], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # fallback: terminal bell
+        sys.stdout.write("\a")
+        sys.stdout.flush()
 
-yt = YouTube(url, on_progress_callback=on_progress)
 
-print(f"\n📹 Title: {yt.title}")
-print(f"👤 Author: {yt.author}")
-print(f"⏱️  Duration: {yt.length // 60}m {yt.length % 60}s")
+def sanitize_filename(name, fallback):
+    for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        name = name.replace(char, '')
+    name = name.strip()
+    return name if name else fallback
 
-# AUDIO ONLY MODE
-if audio_only:
-    print(f"\n🎵 Mode: Audio Only")
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="ytb",
+        description="Download YouTube videos or audio from the command line."
+    )
+    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument(
+        "-o", "--audio-only",
+        action="store_true",
+        help="Download audio only (best available quality)"
+    )
+    parser.add_argument(
+        "-d", "--output-dir",
+        default=os.path.join(os.path.expanduser("~"), "Downloads"),
+        help="Directory to save the file (default: ~/Downloads)"
+    )
+    args = parser.parse_args()
+
+    output_dir = os.path.expanduser(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if not shutil.which("ffmpeg") and not args.audio_only:
+        print("⚠️  ffmpeg not found. Install it first, e.g.: sudo apt install ffmpeg")
+        sys.exit(1)
+
+    print("\n" + "=" * 60)
+    print("Fetching video information...")
+    print("=" * 60)
+
+    yt = YouTube(args.url, on_progress_callback=on_progress)
+
+    print(f"\n📹 Title: {yt.title}")
+    print(f"👤 Author: {yt.author}")
+    print(f"⏱️  Duration: {yt.length // 60}m {yt.length % 60}s")
+
+    # AUDIO ONLY MODE
+    if args.audio_only:
+        print(f"\n🎵 Mode: Audio Only")
+        print("-" * 60)
+
+        audio_stream = (
+            yt.streams
+            .filter(adaptive=True, type="audio")
+            .order_by("abr")
+            .desc()
+            .first()
+        )
+
+        if not audio_stream:
+            print("❌ No audio stream found.")
+            sys.exit(1)
+
+        print(f"Quality: {audio_stream.abr}")
+        print(f"Save location: {output_dir}\n")
+
+        audio_file = audio_stream.download(output_path=output_dir)
+
+        if audio_bar:
+            audio_bar.close()
+
+        print(f"\n✅ Audio download completed!")
+        print(f"📂 Saved to: {audio_file}")
+        print("=" * 60)
+        notify("ytb", "Audio download completed")
+        sys.exit(0)
+
+    # VIDEO + AUDIO MODE (DEFAULT)
+    print(f"\n🎬 Mode: Video + Audio")
     print("-" * 60)
-    
+
+    video_stream = (
+        yt.streams
+        .filter(adaptive=True, type="video", mime_type="video/webm")
+        .order_by("resolution")
+        .desc()
+        .first()
+    )
+
     audio_stream = (
         yt.streams
         .filter(adaptive=True, type="audio")
@@ -80,98 +152,54 @@ if audio_only:
         .first()
     )
 
-    if not audio_stream:
-        print("❌ No audio stream found.")
+    if not video_stream or not audio_stream:
+        print("❌ Could not find suitable streams.")
         sys.exit(1)
 
-    print(f"Quality: {audio_stream.abr}")
-    print(f"Save location: {DOWNLOADS_FOLDER}\n")
+    print(f"Video resolution: {video_stream.resolution}")
+    print(f"Audio quality: {audio_stream.abr}")
+    print(f"Save location: {output_dir}\n")
 
-    audio_file = audio_stream.download(output_path=DOWNLOADS_FOLDER)
+    video_file = video_stream.download(filename="video_temp.mp4", output_path=output_dir)
+    audio_file = audio_stream.download(filename="audio_temp.mp4", output_path=output_dir)
 
+    if video_bar:
+        video_bar.close()
     if audio_bar:
         audio_bar.close()
 
-    print(f"\n✅ Audio download completed!")
-    print(f"📂 Saved to: {audio_file}")
-    print("=" * 60)
-    winsound.MessageBeep(winsound.MB_ICONASTERISK)
-    sys.exit(0)
+    safe_title = sanitize_filename(yt.title, yt.video_id)
+    output_file = os.path.join(output_dir, f"{safe_title}.mp4")
 
-# VIDEO + AUDIO MODE (DEFAULT)
-print(f"\n🎬 Mode: Video + Audio")
-print("-" * 60)
+    print("\n🔄 Merging audio and video...")
 
-video_stream = (
-    yt.streams
-    .filter(adaptive=True, type="video", mime_type="video/webm")
-    .order_by("resolution")
-    .desc()
-    .first()
-)
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", video_file,
+            "-i", audio_file,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            output_file,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
-audio_stream = (
-    yt.streams
-    .filter(adaptive=True, type="audio")
-    .order_by("abr")
-    .desc()
-    .first()
-)
+    os.remove(video_file)
+    os.remove(audio_file)
 
-if not video_stream or not audio_stream:
-    print("❌ Could not find suitable streams.")
-    sys.exit(1)
+    if result.returncode == 0:
+        print("✅ Merge completed successfully!")
+        print(f"\n📂 Saved to: {output_file}")
+        print("=" * 60)
+        notify("ytb", "Video download completed")
+    else:
+        print("❌ Error during merge. Check that ffmpeg is installed correctly.")
+        print("=" * 60)
+        sys.exit(1)
 
-print(f"Video resolution: {video_stream.resolution}")
-print(f"Audio quality: {audio_stream.abr}")
-print(f"Save location: {DOWNLOADS_FOLDER}\n")
 
-video_file = video_stream.download(filename="video_temp.mp4", output_path=DOWNLOADS_FOLDER)
-audio_file = audio_stream.download(filename="audio_temp.mp4", output_path=DOWNLOADS_FOLDER)
-
-if video_bar:
-    video_bar.close()
-if audio_bar:
-    audio_bar.close()
-
-# Clean filename - remove all problematic characters
-safe_title = yt.title
-# Remove characters that are invalid in Windows filenames
-for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
-    safe_title = safe_title.replace(char, '')
-# Remove or replace other problematic characters
-safe_title = safe_title.strip()
-# If title is empty or only contains problematic chars, use video ID
-if not safe_title:
-    safe_title = yt.video_id
-output_file = os.path.join(DOWNLOADS_FOLDER, f"{safe_title}.mp4")
-
-print("\n🔄 Merging audio and video...")
-
-result = subprocess.run(
-    [
-        "ffmpeg",
-        "-y",
-        "-i", video_file,
-        "-i", audio_file,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        output_file,
-    ],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
-
-# Clean up temporary files
-os.remove(video_file)
-os.remove(audio_file)
-
-if result.returncode == 0:
-    print("✅ Merge completed successfully!")
-    print(f"\n📂 Saved to: {output_file}")
-    print("=" * 60)
-    winsound.MessageBeep(winsound.MB_ICONASTERISK)
-else:
-    print("❌ Error during merge. FFmpeg may not be installed.")
-    print("=" * 60)
-    sys.exit(1)
+if __name__ == "__main__":
+    main()
