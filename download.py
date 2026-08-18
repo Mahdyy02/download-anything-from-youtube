@@ -18,9 +18,18 @@ import sys
 # formats to most clients now. "mweb" exposes the full quality ladder once a
 # PO token provider is available (see bgutil-ytdlp-pot-provider in the venv
 # plus ~/bgutil-ytdlp-pot-provider, which supplies tokens via a deno script
-# with no server needed).
-PLAYER_CLIENTS = "mweb"
+# with no server needed). That PO token path is flaky in practice -- it
+# sometimes gets a fresh 403 mid-session for no video-specific reason -- so
+# every mode falls back to the "android" client's progressive stream, which
+# has no PO token requirement and has been reliable in testing, just capped
+# at 360p.
 MAX_HEIGHT = 1080
+
+VIDEO_ATTEMPTS = [
+    ("mweb", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]"),
+    ("android", "b"),
+]
+AUDIO_ATTEMPTS = ["mweb", "android"]
 
 
 def find_yt_dlp():
@@ -69,30 +78,43 @@ def main():
     out_template = os.path.join(output_dir, "%(title)s.%(ext)s")
 
     if args.audio_only:
-        cmd = [
-            yt_dlp_path,
-            "--extractor-args", f"youtube:player_client={PLAYER_CLIENTS}",
-            "-x", "--audio-format", "m4a",
-            "-o", out_template,
-            "--no-playlist",
-            args.url,
+        attempts = [
+            [
+                yt_dlp_path,
+                "--extractor-args", f"youtube:player_client={client}",
+                "-x", "--audio-format", "m4a",
+                "-o", out_template,
+                "--no-playlist",
+                args.url,
+            ]
+            for client in AUDIO_ATTEMPTS
         ]
     else:
-        cmd = [
-            yt_dlp_path,
-            "--extractor-args", f"youtube:player_client={PLAYER_CLIENTS}",
-            "-f", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]",
-            "--merge-output-format", "mp4",
-            "-o", out_template,
-            "--no-playlist",
-            args.url,
+        attempts = [
+            [
+                yt_dlp_path,
+                "--extractor-args", f"youtube:player_client={client}",
+                "-f", fmt,
+                "--merge-output-format", "mp4",
+                "-o", out_template,
+                "--no-playlist",
+                args.url,
+            ]
+            for client, fmt in VIDEO_ATTEMPTS
         ]
 
-    print("\n" + "=" * 60)
-    print("Downloading with yt-dlp...")
-    print("=" * 60 + "\n")
+    result = None
+    for i, cmd in enumerate(attempts):
+        print("\n" + "=" * 60)
+        if i == 0:
+            print("Downloading with yt-dlp...")
+        else:
+            print("Full quality unavailable right now, retrying with a lower-quality fallback...")
+        print("=" * 60 + "\n")
 
-    result = subprocess.run(cmd)
+        result = subprocess.run(cmd)
+        if result.returncode == 0:
+            break
 
     if result.returncode == 0:
         print("\n" + "=" * 60)
