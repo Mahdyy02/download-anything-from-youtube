@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ytb - a simple YouTube downloader CLI.
+ytb - a simple YouTube downloader CLI, backed by yt-dlp.
 
 Usage:
     ytb <youtube_url>
@@ -14,68 +14,42 @@ import shutil
 import subprocess
 import sys
 
-from pytubefix import YouTube
-from tqdm import tqdm
-
-video_bar = None
-audio_bar = None
-
-
-def make_bar(label, total):
-    return tqdm(
-        total=total,
-        unit="B",
-        unit_scale=True,
-        desc=label,
-        leave=True,
-        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
-    )
+# YouTube requires a PO token to serve adaptive (separate video/audio, HD+)
+# formats to most clients now. "mweb" exposes the full quality ladder once a
+# PO token provider is available (see bgutil-ytdlp-pot-provider in the venv
+# plus ~/bgutil-ytdlp-pot-provider, which supplies tokens via a deno script
+# with no server needed).
+PLAYER_CLIENTS = "mweb"
+MAX_HEIGHT = 1080
 
 
-def on_progress(stream, chunk, bytes_remaining):
-    global video_bar, audio_bar
-
-    total = stream.filesize
-    bar = video_bar if stream.type == "video" else audio_bar
-
-    if bar is None:
-        bar = make_bar("Video" if stream.type == "video" else "Audio", total)
-        if stream.type == "video":
-            video_bar = bar
-        else:
-            audio_bar = bar
-
-    bar.n = total - bytes_remaining
-    bar.refresh()
+def find_yt_dlp():
+    """Look for yt-dlp next to the current Python interpreter (venv) first,
+    then fall back to whatever is on PATH."""
+    venv_candidate = os.path.join(os.path.dirname(sys.executable), "yt-dlp")
+    if os.path.isfile(venv_candidate) and os.access(venv_candidate, os.X_OK):
+        return venv_candidate
+    return shutil.which("yt-dlp")
 
 
 def notify(title, message):
-    """Best-effort desktop notification. Silently does nothing if unavailable."""
     if shutil.which("notify-send"):
         subprocess.run(["notify-send", title, message], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        # fallback: terminal bell
         sys.stdout.write("\a")
         sys.stdout.flush()
-
-
-def sanitize_filename(name, fallback):
-    for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
-        name = name.replace(char, '')
-    name = name.strip()
-    return name if name else fallback
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="ytb",
-        description="Download YouTube videos or audio from the command line."
+        description="Download YouTube videos or audio from the command line (powered by yt-dlp)."
     )
     parser.add_argument("url", help="YouTube video URL")
     parser.add_argument(
         "-o", "--audio-only",
         action="store_true",
-        help="Download audio only (best available quality)"
+        help="Download audio only (best available quality, saved as m4a)"
     )
     parser.add_argument(
         "-d", "--output-dir",
@@ -84,120 +58,49 @@ def main():
     )
     args = parser.parse_args()
 
+    yt_dlp_path = find_yt_dlp()
+    if not yt_dlp_path:
+        print("yt-dlp not found. Install it first, e.g.: pip install --user -U yt-dlp")
+        sys.exit(1)
+
     output_dir = os.path.expanduser(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    if not shutil.which("ffmpeg") and not args.audio_only:
-        print("⚠️  ffmpeg not found. Install it first, e.g.: sudo apt install ffmpeg")
-        sys.exit(1)
+    out_template = os.path.join(output_dir, "%(title)s.%(ext)s")
+
+    if args.audio_only:
+        cmd = [
+            yt_dlp_path,
+            "--extractor-args", f"youtube:player_client={PLAYER_CLIENTS}",
+            "-x", "--audio-format", "m4a",
+            "-o", out_template,
+            "--no-playlist",
+            args.url,
+        ]
+    else:
+        cmd = [
+            yt_dlp_path,
+            "--extractor-args", f"youtube:player_client={PLAYER_CLIENTS}",
+            "-f", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]",
+            "--merge-output-format", "mp4",
+            "-o", out_template,
+            "--no-playlist",
+            args.url,
+        ]
 
     print("\n" + "=" * 60)
-    print("Fetching video information...")
-    print("=" * 60)
+    print("Downloading with yt-dlp...")
+    print("=" * 60 + "\n")
 
-    yt = YouTube(args.url, on_progress_callback=on_progress)
-
-    print(f"\n📹 Title: {yt.title}")
-    print(f"👤 Author: {yt.author}")
-    print(f"⏱️  Duration: {yt.length // 60}m {yt.length % 60}s")
-
-    # AUDIO ONLY MODE
-    if args.audio_only:
-        print(f"\n🎵 Mode: Audio Only")
-        print("-" * 60)
-
-        audio_stream = (
-            yt.streams
-            .filter(adaptive=True, type="audio")
-            .order_by("abr")
-            .desc()
-            .first()
-        )
-
-        if not audio_stream:
-            print("❌ No audio stream found.")
-            sys.exit(1)
-
-        print(f"Quality: {audio_stream.abr}")
-        print(f"Save location: {output_dir}\n")
-
-        audio_file = audio_stream.download(output_path=output_dir)
-
-        if audio_bar:
-            audio_bar.close()
-
-        print(f"\n✅ Audio download completed!")
-        print(f"📂 Saved to: {audio_file}")
-        print("=" * 60)
-        notify("ytb", "Audio download completed")
-        sys.exit(0)
-
-    # VIDEO + AUDIO MODE (DEFAULT)
-    print(f"\n🎬 Mode: Video + Audio")
-    print("-" * 60)
-
-    video_stream = (
-        yt.streams
-        .filter(adaptive=True, type="video", mime_type="video/webm")
-        .order_by("resolution")
-        .desc()
-        .first()
-    )
-
-    audio_stream = (
-        yt.streams
-        .filter(adaptive=True, type="audio")
-        .order_by("abr")
-        .desc()
-        .first()
-    )
-
-    if not video_stream or not audio_stream:
-        print("❌ Could not find suitable streams.")
-        sys.exit(1)
-
-    print(f"Video resolution: {video_stream.resolution}")
-    print(f"Audio quality: {audio_stream.abr}")
-    print(f"Save location: {output_dir}\n")
-
-    video_file = video_stream.download(filename="video_temp.mp4", output_path=output_dir)
-    audio_file = audio_stream.download(filename="audio_temp.mp4", output_path=output_dir)
-
-    if video_bar:
-        video_bar.close()
-    if audio_bar:
-        audio_bar.close()
-
-    safe_title = sanitize_filename(yt.title, yt.video_id)
-    output_file = os.path.join(output_dir, f"{safe_title}.mp4")
-
-    print("\n🔄 Merging audio and video...")
-
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i", video_file,
-            "-i", audio_file,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            output_file,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    os.remove(video_file)
-    os.remove(audio_file)
+    result = subprocess.run(cmd)
 
     if result.returncode == 0:
-        print("✅ Merge completed successfully!")
-        print(f"\n📂 Saved to: {output_file}")
+        print("\n" + "=" * 60)
+        print(f"Download completed! Saved to: {output_dir}")
         print("=" * 60)
-        notify("ytb", "Video download completed")
+        notify("ytb", "Download completed")
     else:
-        print("❌ Error during merge. Check that ffmpeg is installed correctly.")
-        print("=" * 60)
+        print("\nDownload failed. See yt-dlp output above for details.")
         sys.exit(1)
 
 
